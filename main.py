@@ -11,7 +11,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from Market_data import get_xauusd_candles
 from Strategy import calculate_signal
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s"
+)
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 SUBSCRIBERS = set()
@@ -43,11 +47,9 @@ async def get_market_signal():
 
 
 def format_signal(result):
-    direction = result["signal"]
-
     return (
         "🥇 GS GOLD SA — XAUUSD M15\n\n"
-        f"SIGNAL: {direction}\n"
+        f"SIGNAL: {result['signal']}\n"
         f"Entry: {result['entry']}\n"
         f"Stop Loss: {result['stop_loss']}\n"
         f"TP1: {result['take_profit_1']}\n"
@@ -64,10 +66,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🥇 GS Gold SA is online!\n\n"
         "You are subscribed to automatic XAUUSD M15 alerts.\n"
-        "Market monitoring runs every 15 minutes.\n\n"
+        "Market checks run every 15 minutes.\n\n"
         "Use /signal for manual analysis.\n"
         "Signals are educational, not financial advice."
     )
+
+    logging.info("Subscriber added: %s", update.effective_chat.id)
 
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -80,24 +84,24 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = await get_market_signal()
 
+        if result["signal"] not in ("BUY", "SELL"):
+            await update.message.reply_text(
+                "🥇 GS GOLD SA — XAUUSD M15\n\n"
+                "SIGNAL: WAIT\n"
+                f"Reason: {result.get('reason', 'No setup')}\n\n"
+                "No confirmed trade setup."
+            )
+            return
+
+        await update.message.reply_text(format_signal(result))
+
     except Exception:
-        logging.exception("Signal calculation failed")
+        logging.exception("Manual signal calculation failed")
+
         await update.message.reply_text(
             "⚠️ Market data unavailable.\n"
             "No trading signal generated."
         )
-        return
-
-    if result["signal"] not in ("BUY", "SELL"):
-        await update.message.reply_text(
-            "🥇 GS GOLD SA — XAUUSD M15\n\n"
-            "SIGNAL: WAIT\n"
-            f"Reason: {result.get('reason', 'No setup')}\n\n"
-            "No confirmed trade setup."
-        )
-        return
-
-    await update.message.reply_text(format_signal(result))
 
 
 async def auto_monitor(application):
@@ -107,20 +111,20 @@ async def auto_monitor(application):
 
     while True:
         try:
-            if SUBSCRIBERS:
+            if not SUBSCRIBERS:
+                logging.info("Waiting for Telegram subscribers")
+
+            else:
+                logging.info("Checking XAUUSD M15 automatically")
+
                 result = await get_market_signal()
                 direction = result["signal"]
 
-                if direction in ("BUY", "SELL"):
-                    signature = (
-                        direction,
-                        result.get("entry"),
-                        result.get("stop_loss"),
-                        result.get("take_profit_1"),
-                        result.get("take_profit_2"),
-                    )
+                logging.info("Automatic signal: %s", direction)
 
-                    if signature != LAST_ALERT:
+                if direction in ("BUY", "SELL"):
+
+                    if direction != LAST_ALERT:
                         message = format_signal(result)
 
                         for chat_id in list(SUBSCRIBERS):
@@ -134,11 +138,15 @@ async def auto_monitor(application):
                                     "Telegram alert delivery failed"
                                 )
 
-                        LAST_ALERT = signature
+                        LAST_ALERT = direction
 
                 else:
                     LAST_ALERT = None
-                    logging.info("Automatic check: WAIT")
+                    logging.info("No confirmed setup: WAIT")
+
+        except asyncio.CancelledError:
+            logging.info("Automatic monitoring cancelled")
+            raise
 
         except Exception:
             logging.exception("Automatic market check failed")
@@ -147,7 +155,23 @@ async def auto_monitor(application):
 
 
 async def post_init(application):
-    application.create_task(auto_monitor(application))
+    logging.info("Starting automatic monitoring task")
+
+    application.bot_data["monitor_task"] = asyncio.create_task(
+        auto_monitor(application)
+    )
+
+
+async def post_stop(application):
+    task = application.bot_data.pop("monitor_task", None)
+
+    if task is not None:
+        task.cancel()
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            logging.info("Monitoring task stopped cleanly")
 
 
 def main():
@@ -165,6 +189,7 @@ def main():
         Application.builder()
         .token(TOKEN)
         .post_init(post_init)
+        .post_stop(post_stop)
         .build()
     )
 

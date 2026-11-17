@@ -5,9 +5,27 @@ import urllib.parse
 import urllib.request
 
 
-def get_xauusd_candles():
+MARKETS = {
+    "XAUUSD": "XAU/USD",
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "USDCHF": "USD/CHF",
+    "AUDUSD": "AUD/USD",
+    "USDCAD": "USD/CAD",
+    "NZDUSD": "NZD/USD",
+}
+
+TIMEFRAMES = {
+    "M15": "15min",
+    "H1": "1h",
+    "H4": "4h",
+}
+
+
+def get_market_candles(symbol, interval="15min"):
     """
-    Fetch XAU/USD 15-minute candles.
+    Fetch market candles from Twelve Data.
     Returns candles in chronological order.
     """
 
@@ -18,10 +36,16 @@ def get_xauusd_candles():
             "TWELVE_DATA_API_KEY is missing"
         )
 
+    if symbol not in MARKETS:
+        raise ValueError(f"Unsupported market: {symbol}")
+
+    if interval not in TIMEFRAMES.values():
+        raise ValueError(f"Unsupported timeframe: {interval}")
+
     params = {
-        "symbol": "XAU/USD",
-        "interval": "15min",
-        "outputsize": 60,
+        "symbol": MARKETS[symbol],
+        "interval": interval,
+        "outputsize": 100,
         "order": "asc",
         "timezone": "UTC",
         "apikey": api_key
@@ -41,7 +65,9 @@ def get_xauusd_candles():
         with urllib.request.urlopen(
             request, timeout=20
         ) as response:
-            data = json.loads(response.read().decode())
+            data = json.loads(
+                response.read().decode()
+            )
 
     except Exception as error:
         raise RuntimeError(
@@ -66,7 +92,12 @@ def get_xauusd_candles():
 
     if len(candles) < 52:
         raise RuntimeError(
-            "Not enough candles for EMA50 strategy"
+            f"Not enough candles for {symbol} {interval}"
         )
 
     return candles
+
+
+def get_xauusd_candles():
+    """Keep compatibility with the existing gold bot."""
+    return get_market_candles("XAUUSD", "15min")

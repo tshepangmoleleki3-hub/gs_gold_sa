@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram import Update
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -412,11 +413,21 @@ def main():
         daemon=True
     ).start()
 
+    telegram_request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=30
+    )
+
     app = (
         Application.builder()
         .token(TOKEN)
+        .request(telegram_request)
         .post_init(post_init)
         .post_stop(post_stop)
+        .bootstrap_retries(5)
         .build()
     )
 

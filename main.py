@@ -3,15 +3,29 @@ import os
 import asyncio
 import logging
 import threading
+
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes
+)
 
-from Market_data import MARKETS, TIMEFRAMES, get_market_candles
+from Market_data import (
+    MARKETS,
+    TIMEFRAMES,
+    get_market_candles
+)
+
 from Strategy import calculate_multi_timeframe_signal
+from trading_session import get_trading_session, is_trade_time
+
+
+# ---------------- CONFIGURATION ----------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,65 +35,95 @@ logging.basicConfig(
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CONFIGURED_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SUBSCRIBERS = set()
-if CONFIGURED_CHAT_ID:
-    SUBSCRIBERS.add(int(CONFIGURED_CHAT_ID))
-
-SCAN_INTERVAL = 3600
-MAX_DAILY_SIGNALS = 2
-API_REQUESTS_PER_MINUTE = 8
 SOUTH_AFRICA = ZoneInfo("Africa/Johannesburg")
+
+SCAN_INTERVAL = 900
+MAX_DAILY_ALERTS = 2
+API_REQUESTS_PER_BATCH = 8
+BATCH_WAIT_SECONDS = 61
+
+SUBSCRIBERS = set()
+
+if CONFIGURED_CHAT_ID:
+    try:
+        SUBSCRIBERS.add(int(CONFIGURED_CHAT_ID))
+    except ValueError:
+        logging.error("Invalid TELEGRAM_CHAT_ID")
 
 LATEST_RESULTS = {}
 LATEST_SCAN_TIME = None
-DAILY_SIGNAL_COUNT = 0
+
+DAILY_ALERT_COUNT = 0
 DAILY_COUNT_DATE = None
+
 SEEN_SETUPS = set()
 
 
+# ---------------- HEALTH SERVER ----------------
+
 class HealthHandler(BaseHTTPRequestHandler):
+
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"GS Gold SA is running!")
+        self.wfile.write(b"GS GOLD SA is running!")
 
     def log_message(self, format, *args):
         pass
 
 
 def start_web_server():
+
     port = int(os.environ.get("PORT", 10000))
+
     server = ThreadingHTTPServer(
-        ("0.0.0.0", port), HealthHandler
+        ("0.0.0.0", port),
+        HealthHandler
     )
+
     server.serve_forever()
 
 
+# ---------------- DAILY COUNTER ----------------
+
 def reset_daily_counter_if_needed():
-    global DAILY_SIGNAL_COUNT, DAILY_COUNT_DATE, SEEN_SETUPS
+
+    global DAILY_ALERT_COUNT
+    global DAILY_COUNT_DATE
+    global SEEN_SETUPS
 
     today = datetime.now(SOUTH_AFRICA).date()
 
     if DAILY_COUNT_DATE != today:
+
         DAILY_COUNT_DATE = today
-        DAILY_SIGNAL_COUNT = 0
+        DAILY_ALERT_COUNT = 0
         SEEN_SETUPS.clear()
 
-    return today
+        logging.info("New South African trading day")
 
+
+# ---------------- MARKET DATA ----------------
 
 async def fetch_one(symbol, timeframe):
+
     candles = await asyncio.to_thread(
         get_market_candles,
         symbol,
         TIMEFRAMES[timeframe]
     )
+
     return symbol, timeframe, candles
 
 
+# ---------------- MARKET SCANNER ----------------
+
 async def scan_all_markets():
-    global DAILY_SIGNAL_COUNT
-    global LATEST_RESULTS, LATEST_SCAN_TIME
+
+    global LATEST_RESULTS
+    global LATEST_SCAN_TIME
+
+    reset_daily_counter_if_needed()
 
     jobs = [
         (symbol, timeframe)
@@ -88,13 +132,21 @@ async def scan_all_markets():
     ]
 
     candle_data = {
-        symbol: {} for symbol in MARKETS
+        symbol: {}
+        for symbol in MARKETS
     }
+
     data_errors = {}
 
-    # Respect Twelve Data's 8-credit/minute limit.
-    for start in range(0, len(jobs), API_REQUESTS_PER_MINUTE):
-        batch = jobs[start:start + API_REQUESTS_PER_MINUTE]
+    for start in range(
+        0,
+        len(jobs),
+        API_REQUESTS_PER_BATCH
+    ):
+
+        batch = jobs[
+            start:start + API_REQUESTS_PER_BATCH
+        ]
 
         responses = await asyncio.gather(
             *[
@@ -105,207 +157,337 @@ async def scan_all_markets():
         )
 
         for job, response in zip(batch, responses):
+
             symbol, timeframe = job
 
             if isinstance(response, Exception):
+
                 data_errors[symbol] = str(response)
+
                 logging.error(
                     "Data error: %s %s: %s",
-                    symbol, timeframe, response
+                    symbol,
+                    timeframe,
+                    response
                 )
+
                 continue
 
             _, returned_timeframe, candles = response
+
             candle_data[symbol][returned_timeframe] = candles
 
-        if start + API_REQUESTS_PER_MINUTE < len(jobs):
-            await asyncio.sleep(61)
+        if start + API_REQUESTS_PER_BATCH < len(jobs):
+            await asyncio.sleep(BATCH_WAIT_SECONDS)
 
     results = {}
 
     for symbol in MARKETS:
-        if symbol in data_errors or len(candle_data[symbol]) != 3:
+
+        if (
+            symbol in data_errors
+            or len(candle_data[symbol]) != 3
+        ):
+
             results[symbol] = {
                 "signal": "WAIT",
                 "reason": "Market data unavailable"
             }
+
             continue
 
         try:
+
+            m15 = candle_data[symbol]["M15"]
+            h1 = candle_data[symbol]["H1"]
+            h4 = candle_data[symbol]["H4"]
+
             result = calculate_multi_timeframe_signal(
                 symbol,
-                candle_data[symbol]["M15"],
-                candle_data[symbol]["H1"],
-                candle_data[symbol]["H4"]
+                m15,
+                h1,
+                h4
             )
 
-            result["signal_candle"] = (
-                candle_data[symbol]["M15"][-2]["datetime"]
-            )
+            result["signal_candle"] = m15[-2]["datetime"]
 
             results[symbol] = result
 
-        except Exception as error:
-            logging.exception("Strategy failed for %s", symbol)
+        except Exception:
+
+            logging.exception(
+                "Strategy failed for %s",
+                symbol
+            )
+
             results[symbol] = {
                 "signal": "WAIT",
                 "reason": "Strategy calculation failed"
             }
 
-    reset_daily_counter_if_needed()
-
-    # Maximum two new actionable alerts per SA day.
-    for symbol, result in results.items():
-        if result.get("signal") not in ("BUY", "SELL"):
-            continue
-
-        setup_key = (
-            symbol,
-            result["signal"],
-            result.get("signal_candle")
-        )
-
-        if setup_key in SEEN_SETUPS:
-            result["signal"] = "WAIT"
-            result["reason"] = "Setup already alerted"
-            continue
-
-        if DAILY_SIGNAL_COUNT >= MAX_DAILY_SIGNALS:
-            result["signal"] = "WAIT"
-            result["reason"] = "Daily alert limit reached"
-            continue
-
-        SEEN_SETUPS.add(setup_key)
-        DAILY_SIGNAL_COUNT += 1
-
     LATEST_RESULTS = results
     LATEST_SCAN_TIME = datetime.now(SOUTH_AFRICA)
 
-    logging.info(
-        "Scan complete. Alerts: %s/%s",
-        DAILY_SIGNAL_COUNT, MAX_DAILY_SIGNALS
-    )
+    logging.info("Market scan completed")
 
     return results
 
 
+# ---------------- ALERT MESSAGE ----------------
+
+def format_alert(symbol, result):
+
+    return (
+        "🥇 GS GOLD SA — TRADE SIGNAL\n\n"
+        f"Market: {symbol}\n"
+        f"Direction: {result['signal']}\n"
+        "Timeframe: M15\n\n"
+        f"Entry: {result['entry']}\n"
+        f"Stop Loss: {result['stop_loss']}\n"
+        f"TP1: {result['take_profit_1']}\n"
+        f"TP2: {result['take_profit_2']}\n\n"
+        f"H4 trend: {result['trend_h4']}\n"
+        f"H1 trend: {result['trend_h1']}\n"
+        f"Reason: {result['reason']}\n\n"
+        f"South African time: "
+        f"{datetime.now(SOUTH_AFRICA).strftime('%Y-%m-%d %H:%M')}\n\n"
+        "DEMO TESTING ONLY. Verify the setup before trading."
+    )
+
+
+# ---------------- TELEGRAM STATUS ----------------
+
 def format_results(results):
+
     lines = [
-        "GS GOLD SA — 8 MARKET SCANNER",
+        "🥇 GS GOLD SA — MARKET SCANNER",
         "H4 + H1 + M15 strategy",
-        f"South Africa: {LATEST_SCAN_TIME}",
-        f"Daily alerts: {DAILY_SIGNAL_COUNT}/2",
+        f"South African time: {LATEST_SCAN_TIME}",
+        f"Daily alerts: {DAILY_ALERT_COUNT}/{MAX_DAILY_ALERTS}",
         ""
     ]
 
     for symbol, result in results.items():
+
         direction = result.get("signal", "WAIT")
+
         lines.append(f"{symbol}: {direction}")
 
         if direction in ("BUY", "SELL"):
+
             lines.extend([
                 f"Entry: {result['entry']}",
                 f"Stop Loss: {result['stop_loss']}",
                 f"TP1: {result['take_profit_1']}",
-                f"TP2: {result['take_profit_2']}",
-                f"H4: {result['trend_h4']}",
-                f"H1: {result['trend_h1']}"
+                f"TP2: {result['take_profit_2']}"
             ])
+
         else:
+
             lines.append(
                 f"Reason: {result.get('reason', 'No setup')}"
             )
 
         lines.append("")
 
-    lines.append("Demo testing only. Verify before trading.")
     lines.append(
-        "Alert limit does not track manual MT5 trades."
+        "Bot alerts are limited to two per SA day."
+    )
+
+    lines.append(
+        "Demo testing only. No profit is guaranteed."
     )
 
     return "\n".join(lines)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------- TELEGRAM COMMANDS ----------------
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     chat_id = update.effective_chat.id
+
     SUBSCRIBERS.add(chat_id)
 
     await update.message.reply_text(
-        "GS GOLD SA is online!\n\n"
-        "Automatic 8-market scanner activated.\n"
-        "H4 + H1 confirmation, M15 entries.\n"
-        "Scanning approximately every hour.\n"
-        "Maximum two actionable alerts per SA day.\n\n"
-        "Use /signal for the latest scan."
+        "🥇 GS GOLD SA is online!\n\n"
+        "Automatic 8-market scanner.\n"
+        "H4 + H1 confirmation with closed M15 candles.\n"
+        "London and New York sessions only.\n"
+        "Maximum two new alerts per South African day.\n\n"
+        "Use /signal for the latest market scan."
     )
 
     logging.info("Subscriber added: %s", chat_id)
 
 
-async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def signal(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     if not LATEST_RESULTS:
+
         await update.message.reply_text(
-            "First market scan is not finished yet. "
-            "Please try again shortly."
+            "No completed market scan yet. "
+            "Please wait for an active trading session."
         )
+
         return
+
+    session = get_trading_session()
 
     await update.message.reply_text(
         format_results(LATEST_RESULTS)
+        + "\n\nCurrent session: "
+        + session["session"]
+        + "\n"
+        + session["message"]
     )
 
 
+# ---------------- AUTOMATIC MONITOR ----------------
+
 async def auto_monitor(application):
-    logging.info("Hourly 8-market monitoring started")
+
+    global DAILY_ALERT_COUNT
+
+    logging.info("GS GOLD SA automatic monitor started")
 
     while True:
+
         try:
-            if not SUBSCRIBERS:
-                logging.info("Waiting for subscribers")
-                await asyncio.sleep(30)
+
+            reset_daily_counter_if_needed()
+
+            if not is_trade_time():
+
+                session = get_trading_session()
+
+                logging.info(
+                    "Outside trading session: %s",
+                    session["session"]
+                )
+
+                await asyncio.sleep(60)
+
                 continue
 
-            results = await scan_all_markets()
-            message = format_results(results)
+            logging.info("Trading session active. Scanning markets.")
 
-            for chat_id in list(SUBSCRIBERS):
-                try:
-                    await application.bot.send_message(
-                        chat_id=chat_id,
-                        text=message
+            results = await scan_all_markets()
+
+            if DAILY_ALERT_COUNT < MAX_DAILY_ALERTS:
+
+                for symbol, result in results.items():
+
+                    if result.get("signal") not in ("BUY", "SELL"):
+                        continue
+
+                    setup_key = (
+                        symbol,
+                        result["signal"],
+                        result.get("signal_candle")
                     )
-                except Exception:
-                    logging.exception(
-                        "Telegram delivery failed"
-                    )
+
+                    if setup_key in SEEN_SETUPS:
+                        continue
+
+                    if DAILY_ALERT_COUNT >= MAX_DAILY_ALERTS:
+                        break
+
+                    if not SUBSCRIBERS:
+                        logging.warning(
+                            "No Telegram subscribers configured"
+                        )
+                        break
+
+                    message = format_alert(symbol, result)
+
+                    delivered = False
+
+                    for chat_id in list(SUBSCRIBERS):
+
+                        try:
+
+                            await application.bot.send_message(
+                                chat_id=chat_id,
+                                text=message
+                            )
+
+                            delivered = True
+
+                        except Exception:
+
+                            logging.exception(
+                                "Telegram delivery failed for %s",
+                                chat_id
+                            )
+
+                    if delivered:
+
+                        SEEN_SETUPS.add(setup_key)
+                        DAILY_ALERT_COUNT += 1
+
+                        logging.info(
+                            "New alert sent: %s %s (%s/%s)",
+                            symbol,
+                            result["signal"],
+                            DAILY_ALERT_COUNT,
+                            MAX_DAILY_ALERTS
+                        )
+
+            logging.info(
+                "Scan finished. Daily alerts: %s/%s",
+                DAILY_ALERT_COUNT,
+                MAX_DAILY_ALERTS
+            )
 
         except asyncio.CancelledError:
+
             raise
 
         except Exception:
-            logging.exception("Automatic scan failed")
+
+            logging.exception("Automatic monitor error")
 
         await asyncio.sleep(SCAN_INTERVAL)
 
 
+# ---------------- APPLICATION START/STOP ----------------
+
 async def post_init(application):
+
     application.bot_data["monitor_task"] = asyncio.create_task(
         auto_monitor(application)
     )
 
 
 async def post_stop(application):
-    task = application.bot_data.pop("monitor_task", None)
+
+    task = application.bot_data.pop(
+        "monitor_task",
+        None
+    )
 
     if task is not None:
+
         task.cancel()
+
         try:
             await task
+
         except asyncio.CancelledError:
             pass
 
 
+# ---------------- MAIN ----------------
+
 def main():
+
     if not TOKEN:
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN is not configured"
@@ -324,11 +506,19 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("signal", signal))
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        CommandHandler("signal", signal)
+    )
+
+    logging.info("Starting GS GOLD SA Telegram bot")
 
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
+

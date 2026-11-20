@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import logging
@@ -427,7 +426,6 @@ def main():
         .request(telegram_request)
         .post_init(post_init)
         .post_stop(post_stop)
-        .bootstrap_retries(5)
         .build()
     )
 
@@ -437,7 +435,7 @@ def main():
 
     logging.info("Starting GS GOLD SA Telegram bot")
 
-    app.run_polling()
+    app.run_polling(bootstrap_retries=5)
 
 
 if __name__ == "__main__":

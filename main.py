@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import logging
@@ -27,8 +26,10 @@ CONFIGURED_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SAST = ZoneInfo("Africa/Johannesburg")
 
 MAX_DAILY_ALERTS = 2
+MAX_DAILY_TRADES = 2
 API_REQUESTS_PER_BATCH = 8
 BATCH_WAIT_SECONDS = 61
+ENTRY_WINDOW_MINUTES = 4
 
 SUBSCRIBERS = set()
 
@@ -41,8 +42,12 @@ if CONFIGURED_CHAT_ID:
 LATEST_RESULTS = {}
 LATEST_SCAN_TIME = None
 DAILY_ALERT_COUNT = 0
+DAILY_TRADE_COUNT = 0
 DAILY_COUNT_DATE = None
 SEEN_SETUPS = set()
+
+# Active trades are held in memory only. A Render restart clears this dictionary.
+ACTIVE_TRADES = {}
 
 
 def format_sast_time(value=None):
@@ -54,6 +59,19 @@ def format_sast_time(value=None):
         value = value.astimezone(SAST)
 
     return value.strftime("%Y-%m-%d %H:%M:%S SAST")
+
+
+def parse_candle_time(value):
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+    # Market_data returns UTC timestamps. Treat naive timestamps as UTC.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+
+    return parsed.astimezone(SAST)
 
 
 def get_m15_countdown():
@@ -91,13 +109,14 @@ def start_web_server():
 
 
 def reset_daily_counter_if_needed():
-    global DAILY_ALERT_COUNT, DAILY_COUNT_DATE, SEEN_SETUPS
+    global DAILY_ALERT_COUNT, DAILY_TRADE_COUNT, DAILY_COUNT_DATE, SEEN_SETUPS
 
     today = datetime.now(SAST).date()
 
     if DAILY_COUNT_DATE != today:
         DAILY_COUNT_DATE = today
         DAILY_ALERT_COUNT = 0
+        DAILY_TRADE_COUNT = 0
         SEEN_SETUPS.clear()
         logging.info("New South African trading day")
 
@@ -179,6 +198,7 @@ async def scan_all_markets():
                 symbol, m15, h1, h4
             )
 
+            # Strategy uses closed candles; m15[-2] is the last completed M15 candle.
             result["signal_candle"] = m15[-2]["datetime"]
             results[symbol] = result
 
@@ -197,12 +217,23 @@ async def scan_all_markets():
 
 
 def format_alert(symbol, result):
+    try:
+        candle_close = parse_candle_time(result["signal_candle"]) + timedelta(minutes=15)
+        entry_deadline = candle_close + timedelta(minutes=ENTRY_WINDOW_MINUTES)
+        timing_text = (
+            f"Next M15 entry candle starts: {format_sast_time(candle_close)}\n"
+            f"Entry confirmation deadline: {format_sast_time(entry_deadline)}\n"
+            f"Only enter if your Exness price still gives a valid setup."
+        )
+    except Exception:
+        timing_text = "Check the current M15 candle time before considering entry."
+
     return (
         "🥇 GS GOLD SA — TRADE SIGNAL\n\n"
         f"Market: {symbol}\n"
         f"Direction: {result['signal']}\n"
         "Timeframe: M15\n\n"
-        f"Entry: {result['entry']}\n"
+        f"Entry reference: {result['entry']}\n"
         f"Stop Loss: {result['stop_loss']}\n"
         f"TP1: {result['take_profit_1']}\n"
         f"TP2: {result['take_profit_2']}\n\n"
@@ -210,9 +241,10 @@ def format_alert(symbol, result):
         f"H1 trend: {result['trend_h1']}\n"
         f"Reason: {result['reason']}\n\n"
         f"Signal detected: {format_sast_time()}\n"
-        f"M15 candle closes in: {get_m15_countdown()}\n\n"
-        "Verify the setup before entry.\n"
-        "DEMO TESTING ONLY."
+        f"{timing_text}\n\n"
+        f"If you manually open this demo trade, send /entered {symbol} "
+        "within the entry window.\n"
+        "DEMO TESTING ONLY. The entry reference is not a guaranteed fill."
     )
 
 
@@ -227,6 +259,7 @@ def format_results(results):
         f"Trading session: {session['session']}",
         f"M15 candle closes in: {get_m15_countdown()}",
         f"Daily alerts: {DAILY_ALERT_COUNT}/{MAX_DAILY_ALERTS}",
+        f"Daily registered trades: {DAILY_TRADE_COUNT}/{MAX_DAILY_TRADES}",
         ""
     ]
 
@@ -236,7 +269,7 @@ def format_results(results):
 
         if direction in ("BUY", "SELL"):
             lines.extend([
-                f"Entry: {result['entry']}",
+                f"Entry reference: {result['entry']}",
                 f"Stop Loss: {result['stop_loss']}",
                 f"TP1: {result['take_profit_1']}",
                 f"TP2: {result['take_profit_2']}"
@@ -248,9 +281,8 @@ def format_results(results):
 
         lines.append("")
 
-    lines.append("Maximum two alerts per South African day.")
+    lines.append("Maximum two alerts and two registered trades per South African day.")
     lines.append("Demo testing only. No profit is guaranteed.")
-
     return "\n".join(lines)
 
 
@@ -269,12 +301,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🥇 GS GOLD SA is online!\n\n"
-        "Automatic market scanner.\n"
+        "Automatic scanner for the configured markets.\n"
         "H4 + H1 confirmation with closed M15 candles.\n"
-        "London and New York sessions only.\n"
-        "Maximum two alerts per South African day.\n\n"
-        "Use /signal for the latest scan.\n"
-        "Use /myid to see your Telegram Chat ID."
+        "London and New York sessions only for new signals.\n"
+        "Maximum two alerts and two registered trades per South African day.\n\n"
+        "Commands:\n"
+        "/signal — latest market scan\n"
+        "/entered XAUUSD — register a demo trade you opened manually\n"
+        "/trades — show active monitored trades\n"
+        "/myid — show your Telegram Chat ID\n\n"
+        "The bot does not place or close trades in Exness."
     )
 
 
@@ -302,6 +338,193 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global DAILY_TRADE_COUNT
+
+    reset_daily_counter_if_needed()
+
+    if not context.args:
+        await update.message.reply_text(
+            "Use this command after manually opening a demo trade:\n"
+            "/entered XAUUSD"
+        )
+        return
+
+    symbol = context.args[0].upper()
+
+    if symbol not in MARKETS:
+        await update.message.reply_text(
+            "Unknown market. Use one of: " + ", ".join(MARKETS.keys())
+        )
+        return
+
+    if symbol in ACTIVE_TRADES:
+        await update.message.reply_text(
+            f"{symbol} already has a trade being monitored. Use /trades."
+        )
+        return
+
+    if DAILY_TRADE_COUNT >= MAX_DAILY_TRADES:
+        await update.message.reply_text(
+            "Daily trade limit reached (2). No more trades should be registered today."
+        )
+        return
+
+    result = LATEST_RESULTS.get(symbol)
+    if not result or result.get("signal") not in ("BUY", "SELL"):
+        await update.message.reply_text(
+            f"No current BUY/SELL setup is available for {symbol}. Do not register a trade."
+        )
+        return
+
+    try:
+        signal_close = parse_candle_time(result["signal_candle"]) + timedelta(minutes=15)
+    except Exception:
+        await update.message.reply_text(
+            "I cannot read the signal candle time. Please wait for a fresh scan."
+        )
+        return
+
+    now = datetime.now(SAST)
+    deadline = signal_close + timedelta(minutes=ENTRY_WINDOW_MINUTES)
+
+    if now < signal_close or now > deadline:
+        await update.message.reply_text(
+            "The entry confirmation window has passed or has not started.\n"
+            f"Expected entry candle: {format_sast_time(signal_close)}\n"
+            f"Deadline: {format_sast_time(deadline)}\n"
+            "Wait for a fresh signal. Do not chase the price."
+        )
+        return
+
+    ACTIVE_TRADES[symbol] = {
+        "direction": result["signal"],
+        "entry_reference": result["entry"],
+        "stop_loss": result["stop_loss"],
+        "take_profit_1": result["take_profit_1"],
+        "take_profit_2": result["take_profit_2"],
+        "signal_candle": result["signal_candle"],
+        "entry_candle_open": signal_close,
+        "registered_at": now,
+        "chat_id": update.effective_chat.id,
+    }
+    DAILY_TRADE_COUNT += 1
+
+    await update.message.reply_text(
+        "🥇 GS GOLD SA — DEMO TRADE REGISTERED\n\n"
+        f"Market: {symbol}\n"
+        f"Direction: {result['signal']}\n"
+        f"Entry reference (not confirmed fill): {result['entry']}\n"
+        f"Stop Loss: {result['stop_loss']}\n"
+        f"TP1: {result['take_profit_1']}\n"
+        f"TP2: {result['take_profit_2']}\n\n"
+        f"Monitoring the M15 candle ending at "
+        f"{format_sast_time(signal_close + timedelta(minutes=15))}.\n"
+        "At that candle close, the bot will check available candle high/low "
+        "and send a status. You must manage/close the position manually in Exness.\n\n"
+        "Daily registered trades: "
+        f"{DAILY_TRADE_COUNT}/{MAX_DAILY_TRADES}."
+    )
+
+
+async def trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ACTIVE_TRADES:
+        await update.message.reply_text("There are no trades currently registered for monitoring.")
+        return
+
+    lines = ["🥇 GS GOLD SA — REGISTERED TRADES", ""]
+    for symbol, trade in ACTIVE_TRADES.items():
+        lines.extend([
+            f"{symbol}: {trade['direction']}",
+            f"Entry reference: {trade['entry_reference']}",
+            f"SL: {trade['stop_loss']}",
+            f"TP1: {trade['take_profit_1']}",
+            f"TP2: {trade['take_profit_2']}",
+            f"Entry candle: {format_sast_time(trade['entry_candle_open'])}",
+            ""
+        ])
+    lines.append("Check your actual position in Exness; the bot cannot see your account.")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def evaluate_active_trades(application):
+    """Evaluate only the completed M15 candle; OHLC cannot reveal intrabar order."""
+    for symbol, trade in list(ACTIVE_TRADES.items()):
+        try:
+            candles = await asyncio.to_thread(
+                get_market_candles, symbol, TIMEFRAMES["M15"]
+            )
+
+            if not candles or len(candles) < 2:
+                continue
+
+            # The final candle may still be forming; use the previous, completed candle.
+            completed = candles[-2]
+            completed_open = parse_candle_time(completed["datetime"])
+            expected_open = trade["entry_candle_open"]
+
+            if completed_open < expected_open:
+                continue
+
+            if completed_open > expected_open:
+                message = (
+                    "🥇 GS GOLD SA — CHECK EXNESS\n\n"
+                    f"{symbol}: the bot missed the exact entry candle while scanning.\n"
+                    "It cannot reliably determine whether TP or SL was reached.\n"
+                    "Please check your Exness demo position and close/manage it yourself."
+                )
+                await application.bot.send_message(
+                    chat_id=trade["chat_id"], text=message
+                )
+                ACTIVE_TRADES.pop(symbol, None)
+                continue
+
+            high = float(completed["high"])
+            low = float(completed["low"])
+            stop = float(trade["stop_loss"])
+            target = float(trade["take_profit_1"])
+
+            if trade["direction"] == "BUY":
+                sl_hit = low <= stop
+                tp_hit = high >= target
+            else:
+                sl_hit = high >= stop
+                tp_hit = low <= target
+
+            if sl_hit and tp_hit:
+                status = (
+                    "BOTH TP1 AND SL WERE INSIDE THE SAME M15 CANDLE.\n"
+                    "Candle OHLC cannot tell which was reached first. "
+                    "Check Exness history immediately."
+                )
+            elif sl_hit:
+                status = "STOP LOSS level was touched in the completed M15 candle. Check Exness."
+            elif tp_hit:
+                status = "TP1 level was touched in the completed M15 candle. Check Exness."
+            else:
+                status = (
+                    "CLOSE / CHECK POSITION: neither TP1 nor SL appears in the completed "
+                    "M15 candle. Your agreed time rule is to close at this candle's end."
+                )
+
+            message = (
+                "🥇 GS GOLD SA — M15 TRADE CHECK\n\n"
+                f"Market: {symbol}\n"
+                f"Direction: {trade['direction']}\n"
+                f"Completed candle: {format_sast_time(completed_open)}\n"
+                f"Status: {status}\n\n"
+                "The bot cannot see your Exness account and cannot close orders. "
+                "Confirm and manage the position manually. Candle data is not tick-by-tick."
+            )
+            await application.bot.send_message(
+                chat_id=trade["chat_id"], text=message
+            )
+            ACTIVE_TRADES.pop(symbol, None)
+
+        except Exception:
+            logging.exception("Could not evaluate active trade for %s", symbol)
+
+
 async def auto_monitor(application):
     global DAILY_ALERT_COUNT
 
@@ -310,17 +533,23 @@ async def auto_monitor(application):
     while True:
         try:
             reset_daily_counter_if_needed()
-            session = get_trading_session()
 
+            # Keep checking registered demo trades even outside new-entry sessions.
+            if ACTIVE_TRADES:
+                await evaluate_active_trades(application)
+
+            session = get_trading_session()
             if not session["allowed"]:
-                logging.info("Outside trading session")
                 await asyncio.sleep(60)
                 continue
 
-            # Wait until just after an M15 candle boundary.
             delay = seconds_until_next_m15_close()
             logging.info("Next M15 scan in %.1f seconds", delay)
             await asyncio.sleep(delay)
+
+            # Check monitored positions after the candle boundary.
+            if ACTIVE_TRADES:
+                await evaluate_active_trades(application)
 
             session = get_trading_session()
             if not session["allowed"]:
@@ -372,13 +601,10 @@ async def auto_monitor(application):
                     if delivered:
                         SEEN_SETUPS.add(setup_key)
                         DAILY_ALERT_COUNT += 1
-
                         logging.info(
                             "New alert sent: %s %s (%s/%s)",
-                            symbol,
-                            result["signal"],
-                            DAILY_ALERT_COUNT,
-                            MAX_DAILY_ALERTS
+                            symbol, result["signal"],
+                            DAILY_ALERT_COUNT, MAX_DAILY_ALERTS
                         )
 
         except asyncio.CancelledError:
@@ -435,6 +661,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("signal", signal))
+    app.add_handler(CommandHandler("entered", entered))
+    app.add_handler(CommandHandler("trades", trades))
 
     logging.info("Starting GS GOLD SA Telegram bot")
     app.run_polling(bootstrap_retries=5)

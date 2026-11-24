@@ -50,6 +50,41 @@ DAILY_COUNT_DATE = None
 SEEN_SETUPS = set()
 
 
+def get_m15_countdown():
+    """
+    Return the time remaining until the next 15-minute boundary
+    in South African time. This is a display countdown, not an
+    instruction to enter a trade.
+    """
+    now = datetime.now(SOUTH_AFRICA)
+
+    elapsed = (
+        (now.minute % 15) * 60
+        + now.second
+        + now.microsecond / 1_000_000
+    )
+
+    remaining = 900 - elapsed
+
+    # Round up so the displayed countdown does not reach 00:00 early.
+    remaining_seconds = max(0, int(remaining + 0.999999))
+    minutes, seconds = divmod(remaining_seconds, 60)
+
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def format_sast_time(value=None):
+    """Format a datetime in South African local time."""
+    if value is None:
+        value = datetime.now(SOUTH_AFRICA)
+    elif value.tzinfo is None:
+        value = value.replace(tzinfo=SOUTH_AFRICA)
+    else:
+        value = value.astimezone(SOUTH_AFRICA)
+
+    return value.strftime("%Y-%m-%d %H:%M:%S SAST")
+
+
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -198,18 +233,22 @@ def format_alert(symbol, result):
         f"H4 trend: {result['trend_h4']}\n"
         f"H1 trend: {result['trend_h1']}\n"
         f"Reason: {result['reason']}\n\n"
-        f"South African time: "
-        f"{datetime.now(SOUTH_AFRICA).strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"South African time: {format_sast_time()}\n"
+        f"Current M15 candle closes in: {get_m15_countdown()}\n\n"
+        "The countdown is informational, not an entry timer.\n"
         "DEMO TESTING ONLY. Verify the setup before trading."
     )
 
 
 def format_results(results):
 
+    scan_time = format_sast_time(LATEST_SCAN_TIME)
+
     lines = [
         "🥇 GS GOLD SA — MARKET SCANNER",
         "H4 + H1 + M15 strategy",
-        f"South African time: {LATEST_SCAN_TIME}",
+        f"South African scan time: {scan_time}",
+        f"Current M15 candle closes in: {get_m15_countdown()}",
         f"Daily alerts: {DAILY_ALERT_COUNT}/{MAX_DAILY_ALERTS}",
         ""
     ]
@@ -234,6 +273,7 @@ def format_results(results):
         lines.append("")
 
     lines.append("Bot alerts are limited to two per SA day.")
+    lines.append("M15 countdown is informational, not an entry timer.")
     lines.append("Demo testing only. No profit is guaranteed.")
 
     return "\n".join(lines)
@@ -263,7 +303,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Automatic 8-market scanner.\n"
         "H4 + H1 confirmation with closed M15 candles.\n"
         "London and New York sessions only.\n"
-        "Maximum two new alerts per South African day.\n\n"
+        "Maximum two new alerts per South African day.\n"
+        "South African timestamps and M15 countdown included.\n\n"
         "Use /signal for the latest market scan.\n"
         "Use /myid to see your Telegram Chat ID."
     )

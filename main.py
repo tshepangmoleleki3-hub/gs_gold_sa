@@ -1,24 +1,20 @@
+
 import os
 import asyncio
 import logging
 import threading
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram import Update
 from telegram.request import HTTPXRequest
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 from Market_data import MARKETS, TIMEFRAMES, get_market_candles
 from Strategy import calculate_multi_timeframe_signal
-from trading_session import get_trading_session, is_trade_time
-
+from trading_session import get_trading_session
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,9 +24,8 @@ logging.basicConfig(
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CONFIGURED_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SOUTH_AFRICA = ZoneInfo("Africa/Johannesburg")
+SAST = ZoneInfo("Africa/Johannesburg")
 
-SCAN_INTERVAL = 900
 MAX_DAILY_ALERTS = 2
 API_REQUESTS_PER_BATCH = 8
 BATCH_WAIT_SECONDS = 61
@@ -50,43 +45,36 @@ DAILY_COUNT_DATE = None
 SEEN_SETUPS = set()
 
 
-def get_m15_countdown():
-    """
-    Return the time remaining until the next 15-minute boundary
-    in South African time. This is a display countdown, not an
-    instruction to enter a trade.
-    """
-    now = datetime.now(SOUTH_AFRICA)
-
-    elapsed = (
-        (now.minute % 15) * 60
-        + now.second
-        + now.microsecond / 1_000_000
-    )
-
-    remaining = 900 - elapsed
-
-    # Round up so the displayed countdown does not reach 00:00 early.
-    remaining_seconds = max(0, int(remaining + 0.999999))
-    minutes, seconds = divmod(remaining_seconds, 60)
-
-    return f"{minutes:02d}:{seconds:02d}"
-
-
 def format_sast_time(value=None):
-    """Format a datetime in South African local time."""
     if value is None:
-        value = datetime.now(SOUTH_AFRICA)
+        value = datetime.now(SAST)
     elif value.tzinfo is None:
-        value = value.replace(tzinfo=SOUTH_AFRICA)
+        value = value.replace(tzinfo=SAST)
     else:
-        value = value.astimezone(SOUTH_AFRICA)
+        value = value.astimezone(SAST)
 
     return value.strftime("%Y-%m-%d %H:%M:%S SAST")
 
 
-class HealthHandler(BaseHTTPRequestHandler):
+def get_m15_countdown():
+    now = datetime.now(SAST)
+    elapsed = (now.minute % 15) * 60 + now.second
+    remaining = 900 - elapsed
+    minutes, seconds = divmod(remaining, 60)
+    return f"{minutes:02d}:{seconds:02d}"
 
+
+def seconds_until_next_m15_close():
+    now = datetime.now(SAST)
+    next_boundary = (
+        now.replace(second=0, microsecond=0)
+        + timedelta(minutes=15 - now.minute % 15)
+    )
+    target = next_boundary + timedelta(seconds=5)
+    return max(1, (target - now).total_seconds())
+
+
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
@@ -97,24 +85,15 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_web_server():
-
     port = int(os.environ.get("PORT", 10000))
-
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", port),
-        HealthHandler
-    )
-
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
 
 def reset_daily_counter_if_needed():
+    global DAILY_ALERT_COUNT, DAILY_COUNT_DATE, SEEN_SETUPS
 
-    global DAILY_ALERT_COUNT
-    global DAILY_COUNT_DATE
-    global SEEN_SETUPS
-
-    today = datetime.now(SOUTH_AFRICA).date()
+    today = datetime.now(SAST).date()
 
     if DAILY_COUNT_DATE != today:
         DAILY_COUNT_DATE = today
@@ -124,20 +103,16 @@ def reset_daily_counter_if_needed():
 
 
 async def fetch_one(symbol, timeframe):
-
     candles = await asyncio.to_thread(
         get_market_candles,
         symbol,
         TIMEFRAMES[timeframe]
     )
-
     return symbol, timeframe, candles
 
 
 async def scan_all_markets():
-
-    global LATEST_RESULTS
-    global LATEST_SCAN_TIME
+    global LATEST_RESULTS, LATEST_SCAN_TIME
 
     reset_daily_counter_if_needed()
 
@@ -151,28 +126,21 @@ async def scan_all_markets():
     data_errors = {}
 
     for start in range(0, len(jobs), API_REQUESTS_PER_BATCH):
-
         batch = jobs[start:start + API_REQUESTS_PER_BATCH]
 
         responses = await asyncio.gather(
-            *[
-                fetch_one(symbol, timeframe)
-                for symbol, timeframe in batch
-            ],
+            *[fetch_one(symbol, timeframe) for symbol, timeframe in batch],
             return_exceptions=True
         )
 
         for job, response in zip(batch, responses):
-
             symbol, timeframe = job
 
             if isinstance(response, Exception):
                 data_errors[symbol] = str(response)
                 logging.error(
                     "Data error: %s %s: %s",
-                    symbol,
-                    timeframe,
-                    response
+                    symbol, timeframe, response
                 )
                 continue
 
@@ -185,7 +153,6 @@ async def scan_all_markets():
     results = {}
 
     for symbol in MARKETS:
-
         if symbol in data_errors or len(candle_data[symbol]) != 3:
             results[symbol] = {
                 "signal": "WAIT",
@@ -197,6 +164,16 @@ async def scan_all_markets():
             m15 = candle_data[symbol]["M15"]
             h1 = candle_data[symbol]["H1"]
             h4 = candle_data[symbol]["H4"]
+
+            if any(
+                candles is None or len(candles) < 52
+                for candles in (m15, h1, h4)
+            ):
+                results[symbol] = {
+                    "signal": "WAIT",
+                    "reason": "Insufficient candle data"
+                }
+                continue
 
             result = calculate_multi_timeframe_signal(
                 symbol, m15, h1, h4
@@ -213,14 +190,13 @@ async def scan_all_markets():
             }
 
     LATEST_RESULTS = results
-    LATEST_SCAN_TIME = datetime.now(SOUTH_AFRICA)
+    LATEST_SCAN_TIME = datetime.now(SAST)
 
     logging.info("Market scan completed")
     return results
 
 
 def format_alert(symbol, result):
-
     return (
         "🥇 GS GOLD SA — TRADE SIGNAL\n\n"
         f"Market: {symbol}\n"
@@ -233,28 +209,28 @@ def format_alert(symbol, result):
         f"H4 trend: {result['trend_h4']}\n"
         f"H1 trend: {result['trend_h1']}\n"
         f"Reason: {result['reason']}\n\n"
-        f"South African time: {format_sast_time()}\n"
-        f"Current M15 candle closes in: {get_m15_countdown()}\n\n"
-        "The countdown is informational, not an entry timer.\n"
-        "DEMO TESTING ONLY. Verify the setup before trading."
+        f"Signal detected: {format_sast_time()}\n"
+        f"M15 candle closes in: {get_m15_countdown()}\n\n"
+        "Verify the setup before entry.\n"
+        "DEMO TESTING ONLY."
     )
 
 
 def format_results(results):
-
-    scan_time = format_sast_time(LATEST_SCAN_TIME)
+    session = get_trading_session()
 
     lines = [
         "🥇 GS GOLD SA — MARKET SCANNER",
         "H4 + H1 + M15 strategy",
-        f"South African scan time: {scan_time}",
-        f"Current M15 candle closes in: {get_m15_countdown()}",
+        f"South African scan time: {format_sast_time(LATEST_SCAN_TIME)}",
+        f"Current South African time: {format_sast_time()}",
+        f"Trading session: {session['session']}",
+        f"M15 candle closes in: {get_m15_countdown()}",
         f"Daily alerts: {DAILY_ALERT_COUNT}/{MAX_DAILY_ALERTS}",
         ""
     ]
 
     for symbol, result in results.items():
-
         direction = result.get("signal", "WAIT")
         lines.append(f"{symbol}: {direction}")
 
@@ -272,17 +248,13 @@ def format_results(results):
 
         lines.append("")
 
-    lines.append("Bot alerts are limited to two per SA day.")
-    lines.append("M15 countdown is informational, not an entry timer.")
+    lines.append("Maximum two alerts per South African day.")
     lines.append("Demo testing only. No profit is guaranteed.")
 
     return "\n".join(lines)
 
 
-# TELEGRAM COMMANDS
-
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     chat_id = update.effective_chat.id
     SUBSCRIBERS.add(chat_id)
 
@@ -290,76 +262,78 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Your Telegram Chat ID is: {chat_id}"
     )
 
-    logging.info("Subscriber added: %s", chat_id)
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     chat_id = update.effective_chat.id
     SUBSCRIBERS.add(chat_id)
 
     await update.message.reply_text(
         "🥇 GS GOLD SA is online!\n\n"
-        "Automatic 8-market scanner.\n"
+        "Automatic market scanner.\n"
         "H4 + H1 confirmation with closed M15 candles.\n"
         "London and New York sessions only.\n"
-        "Maximum two new alerts per South African day.\n"
-        "South African timestamps and M15 countdown included.\n\n"
-        "Use /signal for the latest market scan.\n"
+        "Maximum two alerts per South African day.\n\n"
+        "Use /signal for the latest scan.\n"
         "Use /myid to see your Telegram Chat ID."
     )
 
-    logging.info("Subscriber added: %s", chat_id)
-
 
 async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = get_trading_session()
 
-    if not LATEST_RESULTS:
+    if not session["allowed"]:
         await update.message.reply_text(
-            "No completed market scan yet. "
-            "Please wait for an active trading session."
+            "🥇 GS GOLD SA\n\n"
+            "MARKET CLOSED\n"
+            f"South African time: {format_sast_time()}\n"
+            f"Session: {session['session']}\n\n"
+            "Please wait for the next approved trading session."
         )
         return
 
-    session = get_trading_session()
+    if not LATEST_RESULTS:
+        await update.message.reply_text(
+            "No completed market scan yet. Please wait."
+        )
+        return
 
     await update.message.reply_text(
-        format_results(LATEST_RESULTS)
-        + "\n\nCurrent session: "
-        + session["session"]
-        + "\n"
-        + session["message"]
+        format_results(LATEST_RESULTS) + "\n\n" + session["message"]
     )
 
 
 async def auto_monitor(application):
-
     global DAILY_ALERT_COUNT
 
     logging.info("GS GOLD SA automatic monitor started")
 
     while True:
-
         try:
             reset_daily_counter_if_needed()
+            session = get_trading_session()
 
-            if not is_trade_time():
-                session = get_trading_session()
-                logging.info(
-                    "Outside trading session: %s",
-                    session["session"]
-                )
+            if not session["allowed"]:
+                logging.info("Outside trading session")
                 await asyncio.sleep(60)
                 continue
 
-            logging.info("Trading session active. Scanning markets.")
+            # Wait until just after an M15 candle boundary.
+            delay = seconds_until_next_m15_close()
+            logging.info("Next M15 scan in %.1f seconds", delay)
+            await asyncio.sleep(delay)
+
+            session = get_trading_session()
+            if not session["allowed"]:
+                continue
 
             results = await scan_all_markets()
 
+            session = get_trading_session()
+            if not session["allowed"]:
+                continue
+
             if DAILY_ALERT_COUNT < MAX_DAILY_ALERTS:
-
                 for symbol, result in results.items():
-
                     if result.get("signal") not in ("BUY", "SELL"):
                         continue
 
@@ -389,7 +363,6 @@ async def auto_monitor(application):
                                 text=message
                             )
                             delivered = True
-
                         except Exception:
                             logging.exception(
                                 "Telegram delivery failed for %s",
@@ -408,35 +381,25 @@ async def auto_monitor(application):
                             MAX_DAILY_ALERTS
                         )
 
-            logging.info(
-                "Scan finished. Daily alerts: %s/%s",
-                DAILY_ALERT_COUNT,
-                MAX_DAILY_ALERTS
-            )
-
         except asyncio.CancelledError:
             raise
 
         except Exception:
             logging.exception("Automatic monitor error")
-
-        await asyncio.sleep(SCAN_INTERVAL)
+            await asyncio.sleep(30)
 
 
 async def post_init(application):
-
     application.bot_data["monitor_task"] = asyncio.create_task(
         auto_monitor(application)
     )
 
 
 async def post_stop(application):
-
     task = application.bot_data.pop("monitor_task", None)
 
     if task is not None:
         task.cancel()
-
         try:
             await task
         except asyncio.CancelledError:
@@ -444,7 +407,6 @@ async def post_stop(application):
 
 
 def main():
-
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
 
@@ -475,7 +437,6 @@ def main():
     app.add_handler(CommandHandler("signal", signal))
 
     logging.info("Starting GS GOLD SA Telegram bot")
-
     app.run_polling(bootstrap_retries=5)
 
 

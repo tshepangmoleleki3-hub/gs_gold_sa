@@ -1,3 +1,4 @@
+
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
@@ -15,23 +16,27 @@ def get_trading_session():
     new_york_end = time(19, 0)
 
     if london_start <= current_time < london_end:
-        return {
-            "allowed": True,
-            "session": "LONDON",
-            "message": "London session active."
-        }
+        session = "LONDON"
+        allowed = True
+        message = "London session active."
 
-    if new_york_start <= current_time < new_york_end:
-        return {
-            "allowed": True,
-            "session": "NEW YORK",
-            "message": "New York session active."
-        }
+    elif new_york_start <= current_time < new_york_end:
+        session = "NEW YORK"
+        allowed = True
+        message = "New York session active."
+
+    else:
+        session = "OFF SESSION"
+        allowed = False
+        message = "Outside preferred trading hours. WAIT."
 
     return {
-        "allowed": False,
-        "session": "OFF SESSION",
-        "message": "Outside preferred trading hours. WAIT."
+        "allowed": allowed,
+        "session": session,
+        "message": message,
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M:%S"),
+        "timezone": "SAST"
     }
 
 
